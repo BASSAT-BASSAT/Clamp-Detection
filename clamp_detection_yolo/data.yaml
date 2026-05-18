@@ -1,0 +1,6 @@
+path: C:/Users/asus/Desktop/clamp detection/clamp_detection_yolo
+train: images/train
+val: images/val
+nc: 1
+names:
+  0: Clamp-Detection
