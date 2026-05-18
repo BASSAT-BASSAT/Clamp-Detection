@@ -56,11 +56,15 @@ Options:
 |------|---------|-------------|
 | `--dataset-root` | `Clamp Detection.coco` | Path to Roboflow COCO export |
 | `--output-root` | `clamp_detection_yolo` | Output YOLO dataset directory |
+| `--train-ratio` / `--val-ratio` / `--test-ratio` | `0.80` / `0.15` / `0.05` | Dataset split |
 | `--model` | `yolo11m.pt` | Base YOLO weights |
 | `--epochs` | `50` | Training epochs |
 | `--imgsz` | `640` | Input image size |
+| `--predict-video` | — | Optional video path for inference after training |
 
-Training outputs are saved under `runs/detect/`.
+Training outputs are saved under `runs/clamp_detection/`.
+
+**Colab:** open `train_yolo.ipynb` — it clones this repo and calls `train_yolo.py` (no duplicated logic).
 
 ## Repository contents
 
@@ -68,7 +72,7 @@ Training outputs are saved under `runs/detect/`.
 |------|-------------|
 | `frame_extraction.py` | Extracts 30 evenly spaced frames from `Task.mp4` |
 | `train_yolo.py` | COCO → YOLO conversion and training pipeline |
-| `train_yolo.ipynb` | Notebook version of the training workflow |
+| `train_yolo.ipynb` | Colab notebook (clones repo, imports `train_yolo.py`) |
 | `clamp_detection_yolo/data.yaml` | YOLO dataset configuration |
 
 ## License

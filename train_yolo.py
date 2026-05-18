@@ -6,6 +6,7 @@ import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
+
 import torch
 
 
@@ -51,7 +52,17 @@ def convert_bbox_to_yolo(bbox: list[float], width: int, height: int) -> tuple[fl
     return x_center, y_center, normalized_width, normalized_height
 
 
-def prepare_yolo_dataset(dataset_root: Path, output_root: Path, seed: int = 42, validation_ratio: float = 0.2) -> Path:
+def prepare_yolo_dataset(
+    dataset_root: Path,
+    output_root: Path,
+    seed: int = 42,
+    train_ratio: float = 0.80,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.05,
+) -> Path:
+    if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
+        raise ValueError("train_ratio, val_ratio, and test_ratio must sum to 1.0")
+
     annotations_path = dataset_root / "train" / "_annotations.coco.json"
     if not annotations_path.exists():
         raise FileNotFoundError(f"Missing annotations file: {annotations_path}")
@@ -69,22 +80,33 @@ def prepare_yolo_dataset(dataset_root: Path, output_root: Path, seed: int = 42, 
     shuffled_images = list(images)
     random.Random(seed).shuffle(shuffled_images)
 
-    validation_count = max(1, int(len(shuffled_images) * validation_ratio))
-    if validation_count >= len(shuffled_images):
-        validation_count = 1
-    validation_images = shuffled_images[:validation_count]
-    training_images = shuffled_images[validation_count:]
+    total_images = len(shuffled_images)
+    if total_images < 3:
+        raise ValueError(f"Need at least 3 images for train/val/test split, got {total_images}.")
 
-    if not training_images:
-        raise ValueError("Not enough images to create a training split.")
+    train_count = int(total_images * train_ratio)
+    val_count = int(total_images * val_ratio)
+    test_count = total_images - train_count - val_count
 
-    images_train_dir = output_root / "images" / "train"
-    images_val_dir = output_root / "images" / "val"
-    labels_train_dir = output_root / "labels" / "train"
-    labels_val_dir = output_root / "labels" / "val"
+    if min(train_count, val_count, test_count) < 1:
+        raise ValueError(
+            f"Split produced train={train_count}, val={val_count}, test={test_count}. "
+            "Each split needs at least 1 image — add more data or adjust ratios."
+        )
 
-    for directory in [images_train_dir, images_val_dir, labels_train_dir, labels_val_dir]:
-        directory.mkdir(parents=True, exist_ok=True)
+    train_images = shuffled_images[:train_count]
+    val_images = shuffled_images[train_count : train_count + val_count]
+    test_images = shuffled_images[train_count + val_count :]
+
+    split_dirs = {
+        "train": (output_root / "images" / "train", output_root / "labels" / "train", train_images),
+        "val": (output_root / "images" / "val", output_root / "labels" / "val", val_images),
+        "test": (output_root / "images" / "test", output_root / "labels" / "test", test_images),
+    }
+
+    for images_dir, labels_dir, _ in split_dirs.values():
+        images_dir.mkdir(parents=True, exist_ok=True)
+        labels_dir.mkdir(parents=True, exist_ok=True)
 
     def write_split(split_images: list[dict], images_dir: Path, labels_dir: Path) -> None:
         for image_info in split_images:
@@ -100,16 +122,29 @@ def prepare_yolo_dataset(dataset_root: Path, output_root: Path, seed: int = 42, 
             lines: list[str] = []
             for annotation in image_annotations.get(int(image_info["id"]), []):
                 class_index = category_id_to_class_index[int(annotation["category_id"])]
-                yolo_bbox = convert_bbox_to_yolo(annotation["bbox"], int(image_info["width"]), int(image_info["height"]))
+                yolo_bbox = convert_bbox_to_yolo(
+                    annotation["bbox"],
+                    int(image_info["width"]),
+                    int(image_info["height"]),
+                )
                 if yolo_bbox is None:
                     continue
                 x_center, y_center, box_width, box_height = yolo_bbox
-                lines.append(f"{class_index} {x_center:.6f} {y_center:.6f} {box_width:.6f} {box_height:.6f}")
+                lines.append(
+                    f"{class_index} {x_center:.6f} {y_center:.6f} {box_width:.6f} {box_height:.6f}"
+                )
 
             label_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
-    write_split(training_images, images_train_dir, labels_train_dir)
-    write_split(validation_images, images_val_dir, labels_val_dir)
+    for images_dir, labels_dir, split_images in split_dirs.values():
+        write_split(split_images, images_dir, labels_dir)
+
+    print(
+        f"Split ({total_images} images): "
+        f"train={len(train_images)} ({len(train_images) / total_images:.0%}), "
+        f"val={len(val_images)} ({len(val_images) / total_images:.0%}), "
+        f"test={len(test_images)} ({len(test_images) / total_images:.0%})"
+    )
 
     data_yaml = output_root / "data.yaml"
     class_names_yaml = "\n".join(f"  {index}: {name}" for index, name in enumerate(class_names))
@@ -119,6 +154,7 @@ def prepare_yolo_dataset(dataset_root: Path, output_root: Path, seed: int = 42, 
                 f"path: {output_root.resolve().as_posix()}",
                 "train: images/train",
                 "val: images/val",
+                "test: images/test",
                 f"nc: {len(class_names)}",
                 "names:",
                 class_names_yaml,
@@ -131,26 +167,31 @@ def prepare_yolo_dataset(dataset_root: Path, output_root: Path, seed: int = 42, 
     return data_yaml
 
 
-def train_model(data_yaml: Path, model_name: str, epochs: int, imgsz: int, project_dir: Path) -> None:
+def get_device_str() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch, "has_mps", False) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def train_model(
+    data_yaml: Path,
+    model_name: str,
+    epochs: int,
+    imgsz: int,
+    project_dir: Path,
+    run_name: str = "clamp_detection",
+) -> Path:
     try:
         from ultralytics import YOLO
     except ImportError as error:
-        raise SystemExit(
-            "ultralytics is not installed. Run: pip install ultralytics"
-        ) from error
+        raise SystemExit("ultralytics is not installed. Run: pip install ultralytics") from error
 
-    def _get_device_str() -> str:
-        if torch.cuda.is_available():
-            return "cuda"
-        if getattr(torch, "has_mps", False) and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
-
-    device_str = _get_device_str()
+    device_str = get_device_str()
     print(f"Using device: {device_str}")
 
     model = YOLO(model_name)
-    # Try moving the model to the chosen device if supported by the ultralytics model wrapper
     try:
         model.to(device_str)
     except Exception:
@@ -159,12 +200,84 @@ def train_model(data_yaml: Path, model_name: str, epochs: int, imgsz: int, proje
         except Exception:
             pass
 
-    # Pass device to trainer when available; this keeps training device-agnostic
     try:
-        model.train(data=str(data_yaml), epochs=epochs, imgsz=imgsz, project=str(project_dir), name="clamp_detection", device=device_str)
+        model.train(
+            data=str(data_yaml),
+            epochs=epochs,
+            imgsz=imgsz,
+            project=str(project_dir),
+            name=run_name,
+            device=device_str,
+        )
     except TypeError:
-        # Fallback if ultralytics version does not accept device kwarg
-        model.train(data=str(data_yaml), epochs=epochs, imgsz=imgsz, project=str(project_dir), name="clamp_detection")
+        model.train(
+            data=str(data_yaml),
+            epochs=epochs,
+            imgsz=imgsz,
+            project=str(project_dir),
+            name=run_name,
+        )
+
+    return project_dir / run_name / "weights" / "best.pt"
+
+
+def find_best_weights(project_dir: Path, run_name: str = "clamp_detection") -> Path:
+    candidates = [
+        project_dir / run_name / "weights" / "best.pt",
+        Path("runs") / run_name / "weights" / "best.pt",
+        Path("runs/detect/runs/detect") / run_name / "weights" / "best.pt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        f"Could not find best.pt for run '{run_name}'. Train the model first or pass weights_path explicitly."
+    )
+
+
+def predict_video(
+    input_video: Path,
+    weights_path: Path | None = None,
+    project_dir: Path | None = None,
+    run_name: str = "clamp_detection",
+    inference_name: str = "video_inference",
+    conf: float = 0.25,
+    imgsz: int = 640,
+) -> Path:
+    try:
+        from ultralytics import YOLO
+    except ImportError as error:
+        raise SystemExit("ultralytics is not installed. Run: pip install ultralytics") from error
+
+    if not input_video.exists():
+        raise FileNotFoundError(f"Input video not found: {input_video}")
+
+    project_dir = project_dir or Path("runs")
+    weights_path = weights_path or find_best_weights(project_dir, run_name=run_name)
+
+    print(f"Weights: {weights_path}")
+    print(f"Input video: {input_video}")
+
+    model = YOLO(str(weights_path))
+    results = model.predict(
+        source=str(input_video),
+        save=True,
+        conf=conf,
+        imgsz=imgsz,
+        project=str(project_dir),
+        name=inference_name,
+        device=get_device_str(),
+    )
+
+    save_dir = Path(results[0].save_dir)
+    saved_videos = sorted(save_dir.glob("*.mp4")) + sorted(save_dir.glob("*.avi"))
+    print(f"Saved outputs to: {save_dir}")
+
+    if saved_videos:
+        print(f"Annotated video: {saved_videos[0]}")
+        return saved_videos[0]
+
+    return save_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -175,7 +288,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--train-ratio", type=float, default=0.80)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.05)
+    parser.add_argument("--project-dir", type=Path, default=Path(__file__).resolve().parent / "runs")
+    parser.add_argument("--run-name", type=str, default="clamp_detection")
+    parser.add_argument("--predict-video", type=Path, default=None, help="Run inference on this video after training")
+    parser.add_argument("--conf", type=float, default=0.25)
     return parser.parse_args()
 
 
@@ -189,7 +308,9 @@ def main() -> None:
         dataset_root=args.dataset_root,
         output_root=args.output_root,
         seed=args.seed,
-        validation_ratio=args.val_ratio,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
     )
     print(f"Prepared YOLO dataset at {args.output_root}")
     print(f"Data config: {data_yaml}")
@@ -199,8 +320,18 @@ def main() -> None:
         model_name=args.model,
         epochs=args.epochs,
         imgsz=args.imgsz,
-        project_dir=Path(__file__).resolve().parent / "runs" / "detect",
+        project_dir=args.project_dir,
+        run_name=args.run_name,
     )
+
+    if args.predict_video is not None:
+        predict_video(
+            input_video=args.predict_video,
+            project_dir=args.project_dir,
+            run_name=args.run_name,
+            conf=args.conf,
+            imgsz=args.imgsz,
+        )
 
 
 if __name__ == "__main__":
